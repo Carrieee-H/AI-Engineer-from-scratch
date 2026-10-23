@@ -152,14 +152,14 @@ sim_to_q = doc_vecs @ query_vec
 naive_top_k = np.argsort(sim_to_q)[::-1][:TOP_K].tolist()
 mmr_top_k = mmr_select(query_vec, doc_vecs, top_k=TOP_K, lambda_mult=0.5)
 
-print(f"Query: {query}")
-print(f"\n【对比：纯相关性 Top-{TOP_K}（易选入语义相近的重复内容）】")
-for rank, idx in enumerate(naive_top_k, start=1):
-    print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
+# print(f"Query: {query}")
+# print(f"\n【对比：纯相关性 Top-{TOP_K}（易选入语义相近的重复内容）】")
+# for rank, idx in enumerate(naive_top_k, start=1):
+#     print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
 
-print(f"\n【MMR Top-{TOP_K}（兼顾相关性与多样性）】")
-for rank, idx in enumerate(mmr_top_k, start=1):
-    print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
+# print(f"\n【MMR Top-{TOP_K}（兼顾相关性与多样性）】")
+# for rank, idx in enumerate(mmr_top_k, start=1):
+#     print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
 
 
 # ── Part 2: Bi-Encoder 召回 → Cross-Encoder 精排 ─────────────────────────────
@@ -205,63 +205,26 @@ for rank, (doc, score) in enumerate(reranked, start=1):
  
 
 # ── Part 3·Bi-Encoder 召回 → mmr去冗余 → Cross-Encoder 精排 ─────────────────────────────
+RECALL_K = 8    #召回更多给MMR留出挑选空间
+MMR_LAMBDA = 0.7      # 相关性权重，越小越强调多样性
 
-def bi_encoder_retrieve_mmr(
-    query: str,
-    corpus: list[str],
-    model: SentenceTransformer,
-    top_k: int,
-) -> list[tuple[str, float]]:
-    """Bi-Encoder 向量检索：按余弦相似度取 Top-K。"""
-    q_vec, doc_vecs = bi_encoder_encode(query, corpus, model)
-    scores = doc_vecs @ q_vec
-    ranked_idx = np.argsort(scores)[::-1][:top_k]
-    return [(corpus[i], float(scores[i])) for i in ranked_idx]
+#Step 1: Bi-Encoder 召回 Top-RECALL_K（复用上面已算好的 sim_to_q）
+recall_idx = np.argsort(sim_to_q)[::-1][:RECALL_K]
 
-def mmr_select(
-    query_vec: np.ndarray,
-    doc_vecs: np.ndarray,
-    top_k: int,
-    lambda_mult: float = 0.5,
-) -> list[int]:
-    """MMR 贪心选择：按余弦相似度取 Top-K。"""
-    sim_to_q = doc_vecs @ query_vec
-    selected: list[int] = []
-    candidates = set(range(len(doc_vecs)))
-    while len(selected) < top_k and candidates:
-        best_idx, best_score = None, -1e9
-        for i in candidates:
-            redundancy = max(float(doc_vecs[i] @ doc_vecs[j]) for j in selected) if selected else 0.0
-            score = lambda_mult * sim_to_q[i] - (1 - lambda_mult) * redundancy
-            if score > best_score:
-                best_score, best_idx = score, i
-        selected.append(best_idx) # type: ignore
-        candidates.remove(best_idx) # type: ignore
-    return selected
+#Step 2: 只在召回候选上做 MMR，选出 TOP_K 篇
+mmr_selected = mmr_select(query_vec, doc_vecs[recall_idx], top_k=TOP_K)
+mmr_idx = [int(recall_idx[i]) for i in mmr_selected]
 
-def cross_encoder_rerank_mmr(
-    query: str,
-    candidates: list[str],
-    reranker: CrossEncoder,
-    top_n: int,
-) -> list[tuple[str, float]]:
-    """Cross-Encoder 精排：对 Top-K 候选重排取 Top-N。"""
-    pairs = [[query, doc] for doc in candidates]
-    scores = reranker.predict(pairs)
-    ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-    return ranked[:top_n]
+# Step 3: 把 MMR 选出的文档送进 Cross-Encoder 精排
+candidate_docs_mmr = [CORPUS[i] for i in mmr_idx]
+reranked_mmr = cross_encoder_rerank(query, candidate_docs_mmr, cross_encoder, top_n=TOP_N)
 
-bi_results_mmr = bi_encoder_retrieve_mmr(query, CORPUS, bi_encoder, top_k=TOP_K)
-mmr_selected = mmr_select(query_vec, doc_vecs, top_k=TOP_K, lambda_mult=0.5)
-candidate_docs_mmr = [doc for doc, _ in bi_results_mmr]
-reranked_mmr = cross_encoder_rerank_mmr(query, candidate_docs_mmr, cross_encoder, top_n=TOP_N)
+print(f"\n【Step 1】Bi-Encoder 召回 Top-{RECALL_K}")
+for rank, idx in enumerate(recall_idx, start=1):
+    print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
 
-print(f"\n【Step 1】Bi-Encoder 粗召回 Top-{TOP_K}")
-for rank, (doc, score) in enumerate(bi_results_mmr, start=1):
-    print(f"  Top-{rank} (cos={score:.4f}): {doc}")
-
-print(f"\n【Step 2】MMR 去冗余 Top-{TOP_K}")
-for rank, idx in enumerate(mmr_selected, start=1):
+print(f"\n【Step 2】MMR 去冗余 Top-{TOP_K}（λ={MMR_LAMBDA}）")
+for rank, idx in enumerate(mmr_idx, start=1):
     print(f"  Top-{rank} (cos={sim_to_q[idx]:.4f}): {CORPUS[idx]}")
 
 print(f"\n【Step 3】Cross-Encoder 精排 Top-{TOP_N}")
