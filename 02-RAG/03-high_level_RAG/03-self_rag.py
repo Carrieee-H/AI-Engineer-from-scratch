@@ -22,12 +22,14 @@
 #       · 全部不相关 → 返回「无法回答」
 #
 #    ③ IsSup? — 生成的答案是否完全有文档依据、没有编造？
-#       · 否 → 带着「严格复述文档」的约束重新生成
+#       · 否 → 带着「上一版答案 + 编造反馈」重新生成，并重新检查 ③④
 #       · 是 → 进入下一步
 #
 #    ④ IsUse? — 答案是否完整、清晰地回答了问题？
-#       · 否 → 基于同一文档再生成一次
+#       · 否 → 带着「上一版答案 + 不完整反馈」重新生成，并重新检查 ③④
 #       · 是 → 输出为最终答案
+#
+#    ③④ 最多重试 MAX_RETRIES 次；用尽后：有依据的答案照常返回，有编造的答案返回「无法回答」
 #
 #  流程图：
 #
@@ -41,12 +43,12 @@
 #       [IsRel?]  文档相关吗？ ──否──► 换下一条文档（循环）
 #          │ 是
 #          ▼
-#       基于该文档生成候选答案
-#          │
-#       [IsSup?]  有文档依据吗？ ──否──► 强调「勿编造」后重生成
-#          │ 是
-#          ▼
-#       [IsUse?]  答案好用吗？ ──否──► 重新生成
+#       基于该文档生成候选答案 ◄──────────────────────────┐
+#          │                                             │ 带反馈重生成
+#       [IsSup?]  有文档依据吗？ ──否──────────────────────┤ （最多 MAX_RETRIES 次）
+#          │ 是                                           │
+#          ▼                                             │
+#       [IsUse?]  答案好用吗？ ──否────────────────────────┘
 #          │ 是
 #          ▼
 #        最终答案
@@ -63,12 +65,11 @@ import sys
 
 import faiss
 from dotenv import load_dotenv
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from sentence_transformers import SentenceTransformer
 
 sys.stdout.reconfigure(encoding="utf-8")
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
 
 # ── 语料库 + 向量索引 ─────────────────────────────────────────────────────────
 
@@ -100,116 +101,142 @@ def _parse_yes(text: str) -> bool:
     return t.startswith("是") or t == "yes" or "yes" in t.split()
 
 
-def reflect_retrieve(llm: ChatDeepSeek, question: str) -> bool:
+def _judge(llm: ChatOpenAI, prompt: str) -> tuple[bool, str]:
+    """先让 LLM 说明理由再给结论（比只回一个字更稳定），返回 (结论, 理由)。"""
+    text = llm.invoke(
+        prompt + "\n先用一句话说明理由，最后一行只写：是 或 否"
+    ).content.strip()
+    lines = text.splitlines()
+    return _parse_yes(lines[-1]), " ".join(lines[:-1]).strip()
+
+
+def reflect_retrieve(llm: ChatOpenAI, question: str) -> tuple[bool, str]:
     """[Retrieve?] 是否需要检索文档。"""
-    r = llm.invoke(
+    return _judge(
+        llm,
         f"判断以下问题是否需要查阅公司员工手册才能准确回答。\n"
-        f"问题：{question}\n"
-        f"只回答一个字：是 或 否"
+        f"问题：{question}",
     )
-    return _parse_yes(r.content)
 
 
-def reflect_relevant(llm: ChatDeepSeek, question: str, doc: str) -> bool:
+def reflect_relevant(llm: ChatOpenAI, question: str, doc: str) -> tuple[bool, str]:
     """[IsRel?] 检索文档是否与问题相关。"""
-    r = llm.invoke(
+    return _judge(
+        llm,
         f"判断以下文档是否有助于回答问题。\n"
         f"问题：{question}\n"
-        f"文档：{doc}\n"
-        f"只回答一个字：是 或 否"
+        f"文档：{doc}",
     )
-    return _parse_yes(r.content)
 
 
-def reflect_supported(llm: ChatDeepSeek, doc: str, answer: str) -> bool:
+def reflect_supported(llm: ChatOpenAI, doc: str, answer: str) -> tuple[bool, str]:
     """[IsSup?] 答案是否有文档依据。"""
-    r = llm.invoke(
+    return _judge(
+        llm,
         f"判断以下答案是否完全基于文档内容，没有编造。\n"
         f"文档：{doc}\n"
-        f"答案：{answer}\n"
-        f"只回答一个字：是 或 否"
+        f"答案：{answer}",
     )
-    return _parse_yes(r.content)
 
 
-def reflect_useful(llm: ChatDeepSeek, question: str, answer: str) -> bool:
+def reflect_useful(llm: ChatOpenAI, question: str, answer: str) -> tuple[bool, str]:
     """[IsUse?] 答案是否完整有用。"""
-    r = llm.invoke(
+    return _judge(
+        llm,
         f"判断以下答案是否完整、清晰地回答了问题。\n"
         f"问题：{question}\n"
-        f"答案：{answer}\n"
-        f"只回答一个字：是 或 否"
+        f"答案：{answer}",
     )
-    return _parse_yes(r.content)
 
 
-def generate_answer(llm: ChatDeepSeek, question: str, doc: str = "") -> str:
-    if doc:
-        prompt = (
-            f"根据以下参考资料回答问题，不要编造资料中没有的内容。\n"
-            f"参考资料：{doc}\n\n问题：{question}"
+def generate_answer(
+    llm: ChatOpenAI,
+    question: str,
+    doc: str = "",
+    prev_answer: str = "",
+    feedback: str = "",
+) -> str:
+    if not doc:
+        return llm.invoke(f"请回答：{question}").content.strip()
+
+    prompt = (
+        f"根据以下参考资料回答问题，不要编造资料中没有的内容。\n"
+        f"参考资料：{doc}\n\n问题：{question}"
+    )
+    if prev_answer:
+        # 重新生成时告诉 LLM 上一版答案及其问题，避免 temperature=0 时原样重复
+        prompt += (
+            f"\n\n你上一次的回答是：{prev_answer}\n"
+            f"存在的问题：{feedback}\n"
+            f"请针对该问题修正后重新回答。"
         )
-    else:
-        prompt = f"请回答：{question}"
     return llm.invoke(prompt).content.strip()
 
 
 # ── Self-RAG 主流程 ───────────────────────────────────────────────────────────
 
-def self_rag(question: str, llm: ChatDeepSeek) -> str:
+MAX_RETRIES = 2   # IsSup / IsUse 未通过时最多重新生成的次数
+
+
+def self_rag(question: str, llm: ChatOpenAI) -> str:
     print(f"问题：{question}")
 
     # ① Retrieve?
-    if not reflect_retrieve(llm, question):
-        print("  [Retrieve?] 否 → 直接生成")
+    need_retrieve, reason = reflect_retrieve(llm, question)
+    if not need_retrieve:
+        print(f"  [Retrieve?] 否 → 直接生成（{reason}）")
         return generate_answer(llm, question)
 
-    print("  [Retrieve?] 是 → FAISS 向量检索")
+    print(f"  [Retrieve?] 是 → FAISS 向量检索（{reason}）")
     candidates = vector_search(question, top_k=3)
 
     # ② IsRel? — 逐条检验，取第一条相关文档
     doc = ""
     for score, text in candidates:
         print(f"  候选文档 (score={score:.3f}): {text[:40]}...")
-        if reflect_relevant(llm, question, text):
+        relevant, reason = reflect_relevant(llm, question, text)
+        if relevant:
             doc = text
-            print(f"  [IsRel?] 是 → 采用该文档")
+            print(f"  [IsRel?] 是 → 采用该文档（{reason}）")
             break
-        print("  [IsRel?] 否 → 换下一条")
+        print(f"  [IsRel?] 否 → 换下一条（{reason}）")
 
     if not doc:
         print("  无相关文档，无法回答")
         return "根据现有资料，无法回答该问题。"
 
-    # 生成候选答案
+    # ③④ IsSup? + IsUse? — 生成 → 验证 → 带反馈重生成，最多重试 MAX_RETRIES 次
     answer = generate_answer(llm, question, doc)
+    for attempt in range(MAX_RETRIES + 1):
+        supported = reflect_supported(llm, doc, answer)
+        useful = supported and reflect_useful(llm, question, answer)  # 有编造的答案不必再评是否好用
 
-    # ③ IsSup?
-    if not reflect_supported(llm, doc, answer):
-        print("  [IsSup?] 否 → 重新生成（强调基于文档）")
-        answer = generate_answer(
-            llm, question,
-            doc + "\n（请严格复述文档中的事实，不要添加文档以外的信息）",
-        )
-    else:
-        print("  [IsSup?] 是 → 答案有文档支撑")
+        if useful:
+            print(f"  第{attempt + 1}版：[IsSup?] 是  [IsUse?] 是 → 输出最终答案")
+            return answer
 
-    # ④ IsUse?
-    if not reflect_useful(llm, question, answer):
-        print("  [IsUse?] 否 → 重新生成")
-        answer = generate_answer(llm, question, doc)
-    else:
-        print("  [IsUse?] 是 → 输出最终答案")
+        if not supported:
+            print(f"  第{attempt + 1}版：[IsSup?] 否 → 带反馈重新生成")
+            feedback = "答案中包含参考资料里没有的内容，请只使用资料中的事实。"
+        else:
+            print(f"  第{attempt + 1}版：[IsSup?] 是  [IsUse?] 否 → 带反馈重新生成")
+            feedback = "答案没有完整、清晰地回答问题，请在资料范围内补充完整。"
 
-    return answer
+        if attempt < MAX_RETRIES:
+            answer = generate_answer(llm, question, doc, prev_answer=answer, feedback=feedback)
+
+    # 重试用尽：有依据但不够完整的答案仍可返回；有编造的答案宁可不答
+    print("  达到重试上限")
+    return answer if supported else "根据现有资料，无法给出有可靠依据的答案。"
 
 
 # ── 演示 ──────────────────────────────────────────────────────────────────────
 
-llm = ChatDeepSeek(
-    model="deepseek-chat",
+llm = ChatOpenAI(
+    model=os.getenv("LLM_MODEL", "x-test-3"),
     temperature=0,
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL"),
 )
 
 print("【Self-RAG】示例 1：事实性问题（需检索）")
