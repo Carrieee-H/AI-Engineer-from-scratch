@@ -22,6 +22,7 @@
 #
 #  普通 RAG:  question → 检索 → LLM
 #  Agentic:   question → LLM ⇄ 工具（0~N 次）→ 答案
+#  问题：是否需要进行下一步由LLM自己判读
 #
 #  依赖：
 #    pip install langchain-deepseek sentence-transformers faiss-cpu python-dotenv
@@ -37,7 +38,7 @@ import faiss
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from sentence_transformers import SentenceTransformer
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -114,24 +115,18 @@ def _format_messages(messages) -> str:
     return "\n\n".join(blocks)
 
 
-def _format_response(response) -> str:
-    """将 Agent 响应格式化为可读文本（含 tool_calls）。"""
-    parts = []
-    if response.content:
-        parts.append(response.content)
-    if response.tool_calls:
-        parts.append("tool_calls:")
-        for tc in response.tool_calls:
-            parts.append(f"  - {tc['name']}({tc['args']})")
-    return "\n".join(parts) if parts else "(无文本内容，且无 tool_calls)"
+def _indent(text: str, prefix: str = "      ") -> str:
+    """多行文本整体缩进，避免第二行顶格。"""
+    return "\n".join(prefix + line for line in text.splitlines())
 
 
 # ── Agentic RAG 主循环 ────────────────────────────────────────────────────────
 
 def agentic_rag(
     question: str,
-    llm: ChatDeepSeek,
+    llm: ChatOpenAI,
     max_steps: int = 5,
+    verbose: bool = False,   # True 时打印每一步完整的 messages，用于调试
 ) -> str:
     """
     LLM 自主决策的工具调用循环：
@@ -144,38 +139,32 @@ def agentic_rag(
     ]
 
     for step in range(1, max_steps + 1):
-        print(f"\n{'─' * 60}")
-        print(f"Step {step} | Agent 决策: 是否需要检索？")
-        print(f"{'─' * 60}")
-        print(">>> 完整 Prompt（messages）:")
-        print(_format_messages(messages))
-        print(f"{'─' * 60}")
+        if verbose:
+            print(f"\n>>> Step {step} 完整 Prompt（messages）:")
+            print(_format_messages(messages))
+
         response = llm_with_tools.invoke(messages)
-        print("<<< 完整 Response:")
-        print(_format_response(response))
-        print(f"{'─' * 60}")
         messages.append(response)
 
         if not response.tool_calls:
-            print(f"  Step {step} | Agent tools: 无需更多工具，生成最终答案")
+            print(f"\n[Step {step}] LLM 决策：信息已足够 → 生成最终答案")
             return response.content
 
-        for tool_call in response.tool_calls:
-            name = tool_call["name"]
-            args = tool_call["args"]
-            print(f"  Step {step} | 工具: {name}({args})")
-
+        print(f"\n[Step {step}] LLM 决策：调用工具 {len(response.tool_calls)} 次")
+        for i, tool_call in enumerate(response.tool_calls, start=1):
+            name, args = tool_call["name"], tool_call["args"]
             if name == "search_handbook":
                 result = search_handbook.invoke(args)
             else:
                 result = f"未知工具: {name}"
 
-            print(f"           结果: {result[:80]}{'...' if len(result) > 80 else ''}")
-            messages.append(
-                ToolMessage(content=result, tool_call_id=tool_call["id"])
-            )
+            print(f"  ({i}) → {name}({args})")
+            print("      ← 返回：")
+            print(_indent(result, prefix="        "))
+            messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
 
     # 达到步数上限，强制总结
+    print(f"\n[达到步数上限 {max_steps}] 强制生成最终答案")
     final = llm.invoke(
         messages
         + [HumanMessage(content="请根据已有检索结果给出最终答案，不要继续调用工具。")]
@@ -185,10 +174,11 @@ def agentic_rag(
 
 # ── 演示 ──────────────────────────────────────────────────────────────────────
 
-llm = ChatDeepSeek(
-    model="deepseek-chat",
+llm = ChatOpenAI(
+    model=os.getenv("LLM_MODEL", "default"),
     temperature=0,
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL"),
 )
 
 # print("【Agentic RAG】示例 1：单主题政策问答")
@@ -197,9 +187,14 @@ llm = ChatDeepSeek(
 # answer1 = agentic_rag(q1, llm)
 # print(f"最终答案：{answer1}\n")
 
-print("=" * 60)
-print("【Agentic RAG】示例 2：多主题需多次检索")
-q2 = "公司几号发工资？报销需要什么材料？"
-print(f"问题：{q2}")
-answer2 = agentic_rag(q2, llm)
-print(f"最终答案：{answer2}")
+# print("=" * 60)
+# print("【Agentic RAG】示例 2：多主题需多次检索")
+# q2 = "公司几号发工资？报销需要什么材料？"
+# print(f"问题：{q2}")
+# print("=" * 60)
+# answer2 = agentic_rag(q2, llm)
+# print(f"\n{'─' * 60}\n最终答案：\n{answer2}")
+
+q3 = "你好"
+answer3 = agentic_rag(q3, llm)
+print(f"\n{'─' * 60}\n最终答案：\n{answer3}")
